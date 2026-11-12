@@ -1,0 +1,40 @@
+# Ambiente virtual
+.venv/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Pytest
+.pytest_cache/
+
+# Banco local gerado pelos testes
+*.db
+
+# Coverage
+.coverage
+htmlcov/
+
+# Ambiente local
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.db
+
+# Artefatos locais de auditoria
+core-box.tar.gz
+core-box.sha256
+docker-build.json
+gitleaks-report.json
+junit.xml
+sbom.cdx.json
+semgrep-report.json
+trivy-fs.json
+trivy-image.json
+zap-report.html
+zap-report.json
+
+# Coverage
+.coverage
+htmlcov/
