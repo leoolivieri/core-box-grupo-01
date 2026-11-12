@@ -1,0 +1,374 @@
+name: Esteira DevSecOps - Core Box
+
+on:
+  push:
+    branches:
+      - main
+      - lab1/esteira-auditoria
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  gitleaks:
+    name: "1 - Gitleaks"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar Gitleaks
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/scripts/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Scan de segredos - modo auditoria
+        continue-on-error: true
+        run: |
+          gitleaks detect \
+            --source . \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 1
+
+      - name: Publicar relatório Gitleaks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-gitleaks
+          path: gitleaks-report.json
+  semgrep:
+    name: "2 - Semgrep"
+    needs: gitleaks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Scan SAST - modo auditoria
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config p/python \
+            --config p/flask \
+            --config p/secrets \
+            --config p/dockerfile \
+            --metrics off \
+            --json \
+            --output semgrep-report.json
+
+      - name: Publicar relatório Semgrep
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-semgrep
+          path: semgrep-report.json
+  build_testes:
+    name: "3 - Build e pytest"
+    needs: semgrep
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Executar testes - modo auditoria
+        continue-on-error: true
+        run: |
+          pytest -v --junitxml=junit.xml
+
+      - name: Empacotar aplicacao
+        run: |
+          tar -czf core-box.tar.gz app config wsgi.py requirements.txt
+          sha256sum core-box.tar.gz > core-box.sha256
+
+      - name: Publicar relatorio de build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-03-build
+          path: |
+            junit.xml
+            core-box.tar.gz
+            core-box.sha256
+  trivy_sca:
+    name: "4 - Trivy FS e SBOM"
+    needs: build_testes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Trivy filesystem - modo auditoria
+        run: |
+          trivy fs . \
+            --format json \
+            --output trivy-fs.json
+
+      - name: Gerar SBOM CycloneDX
+        run: |
+          trivy fs . \
+            --format cyclonedx \
+            --output sbom.cdx.json
+
+      - name: Publicar relatorio Trivy SCA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-04-trivy-sca
+          path: |
+            trivy-fs.json
+            sbom.cdx.json
+  docker_build:
+    name: "5 - Docker Build e GHCR"
+    needs: trivy_sca
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Gerar nome da imagem
+        id: image
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Construir e publicar imagem
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+
+      - name: Registrar digest
+        run: |
+          echo "Imagem: ${{ steps.image.outputs.name }}" > docker-build.txt
+          echo "Digest: ${{ steps.build.outputs.digest }}" >> docker-build.txt
+          echo "Commit: ${{ github.sha }}" >> docker-build.txt
+
+      - name: Publicar evidência do build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-build
+          path: docker-build.txt
+  trivy_image:
+    name: "6 - Trivy Image"
+    needs: docker_build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Instalar Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Scan da imagem - modo auditoria
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-image.json \
+            ghcr.io/${GITHUB_REPOSITORY,,}@${{ needs.docker_build.outputs.digest }}
+
+      - name: Gerar resumo do Trivy Image
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+
+          with open("trivy-image.json") as arquivo:
+              dados = json.load(arquivo)
+
+          vulnerabilidades = [
+              vulnerabilidade
+              for resultado in dados.get("Results", [])
+              for vulnerabilidade in (resultado.get("Vulnerabilities") or [])
+          ]
+
+          severidades = Counter(
+              vulnerabilidade.get("Severity", "UNKNOWN")
+              for vulnerabilidade in vulnerabilidades
+          )
+
+          with open("trivy-image-resumo.txt", "w") as resumo:
+              resumo.write(f"Total: {len(vulnerabilidades)}\n")
+              resumo.write(f"CRITICAL: {severidades['CRITICAL']}\n")
+              resumo.write(f"HIGH: {severidades['HIGH']}\n")
+              resumo.write(f"MEDIUM: {severidades['MEDIUM']}\n")
+              resumo.write(f"LOW: {severidades['LOW']}\n")
+              resumo.write(f"UNKNOWN: {severidades['UNKNOWN']}\n")
+          PY
+
+      - name: Publicar relatório Trivy Image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image
+          path: |
+            trivy-image.json
+            trivy-image-resumo.txt
+  zap:
+    name: "7 - Homologacao e OWASP ZAP"
+    needs:
+      - docker_build
+      - trivy_image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir aplicacao em homologacao
+        run: |
+          docker run -d \
+            --name core-box-hml \
+            -p 8000:8000 \
+            ghcr.io/${GITHUB_REPOSITORY,,}@${{ needs.docker_build.outputs.digest }}
+
+      - name: Aguardar health check
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8000/health; then
+              echo "Core Box esta pronto para o ZAP"
+              exit 0
+            fi
+
+            echo "Aguardando Core Box... tentativa $i/30"
+            sleep 2
+          done
+
+          echo "Core Box nao ficou saudavel"
+          docker logs core-box-hml
+          exit 1
+
+      - name: OWASP ZAP Baseline - modo auditoria
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --network host \
+            -v "$PWD:/zap/wrk/:rw" \
+            -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://localhost:8000 \
+            -r zap-report.html \
+            -J zap-report.json \
+            -I
+
+      - name: Publicar relatorio ZAP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: homologacao-zap
+          path: |
+            zap-report.html
+            zap-report.json
+
+      - name: Mostrar logs da homologacao
+        if: always()
+        run: |
+          docker logs core-box-hml || true
+
+      - name: Encerrar homologacao
+        if: always()
+        run: |
+          docker rm -f core-box-hml || true
+  producao:
+    name: "8 - Aprovacao e Producao"
+    needs:
+      - docker_build
+      - trivy_image
+      - zap
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: producao
+
+    steps:
+      - name: Mostrar imagem candidata
+        run: |
+          echo "Imagem aprovada para deploy:"
+          echo "ghcr.io/${GITHUB_REPOSITORY,,}@${{ needs.docker_build.outputs.digest }}"
+
+      - name: Resumo da etapa de producao
+        run: |
+          echo "## Etapa 8 - Producao" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Environment: producao" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Digest: ${{ needs.docker_build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Status: aguardando configuracao de deploy" >> "$GITHUB_STEP_SUMMARY"
